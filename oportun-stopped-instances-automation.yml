@@ -1,0 +1,274 @@
+description: 'An Automation runbook that patches groups of Amazon EC2 instances in stopped state with provided AWS tags'
+schemaVersion: '0.3'
+assumeRole: '{{AutomationAssumeRole}}'
+parameters:
+  AutomationAssumeRole:
+    default: ''
+    type: String
+    description: '(Required) The Amazon Resource Name (ARN) of the IAM role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to operate this runbook.'
+  PrimaryPatchGroupTag:
+    type: StringMap
+    description: '(Required) The tag for the primary group of instances you want to patch. Specify a key-value pair. Example: {"key" : "value"}'
+  SnapshotId:
+    type: String
+    description: '(Required) The snapshot ID to use to retrieve a patch baseline snapshot.'
+    default: ''
+  RebootOption:
+    type: String
+    description: '(Optional) Reboot behavior after a patch Install operation. If you choose NoReboot and patches are installed, the instance is marked as non-compliant until a subsequent reboot and scan.'
+    allowedValues:
+      - NoReboot
+      - RebootIfNeeded
+    default: RebootIfNeeded
+  Operation:
+    type: String
+    description: '(Optional) The update or configuration to perform on the instance. The system checks if patches specified in the patch baseline are installed on the instance. The install operation installs patches missing from the baseline.'
+    allowedValues:
+      - Install
+      - Scan
+    default: Install
+  ReportS3Bucket:
+    type: String
+    description: '(Required) S3 bucket for patch report'
+    default: 'patch-manager-report-176385768664'
+  AnsiblePlaybookFile: 
+    type: String
+    description: '(Required) Ansible playbook that applies patches'
+    default: 'install_httpd.yml'
+  S3PrefixForPatchReport:
+    type: String
+    description: '(Optional) S3 Prefix for Patch report'
+    default: 'script-output'
+mainSteps:
+    - name: getPrimaryInstanceState
+      action: 'aws:executeScript'
+      timeoutSeconds: 120
+      onFailure: Abort
+      inputs:
+        Runtime: python3.7
+        Handler: getInstanceStates
+        InputPayload:
+          primaryTag: '{{PrimaryPatchGroupTag}}'
+        Script: |-
+          def getInstanceStates(events,context):
+            import boto3
+  
+            #Initialize client
+            ec2 = boto3.client('ec2')
+            tag = events['primaryTag']
+            tagKey, tagValue = list(tag.items())[0]
+            instanceQuery = ec2.describe_instances(
+            Filters=[
+                {
+                    "Name": "tag:" + tagKey,
+                    "Values": [tagValue]
+                },
+                {
+                    "Name": "instance-state-name",
+                    "Values": ['stopped']
+                }]
+            )
+            if not instanceQuery['Reservations']:
+                noInstancesForTagString = "No instances found for specified tag in stopped state."
+                return({ 'noInstancesFound' : noInstancesForTagString })
+            else:
+                queryResponse = instanceQuery['Reservations']
+                originalInstanceStates = {}
+                for results in queryResponse:
+                    instanceSet = results['Instances']
+                    for instance in instanceSet:
+                        instanceId = instance['InstanceId']
+                        originalInstanceStates[instanceId] = instance['State']['Name']
+                        print ("originalInstanceStates[instanceId]")
+                        tag_response = ec2.create_tags(
+                            Resources = [instanceId],
+                            Tags = [
+                                {
+                                    'Key': 'PatchAutomation',
+                                    'Value': 'ScriptRunning'
+                                }
+                            ]
+                        )
+                return originalInstanceStates
+      outputs:
+        - Name: originalInstanceStates
+          Selector: $.Payload
+          Type: StringMap
+      nextStep: startStoppedInstances
+    - name: startStoppedInstances
+      action: 'aws:executeScript'
+      timeoutSeconds: 600
+      onFailure: step:returnPrimaryToOriginalState
+      inputs:
+        Runtime: python3.7
+        Handler: startStoppedInstances
+        InputPayload:
+          targetInstances: '{{getPrimaryInstanceState.originalInstanceStates}}'
+        Script: |-
+          def startStoppedInstances(events,context):
+            import boto3
+  
+            #Initialize client
+            ec2 = boto3.client('ec2')
+            instanceDict = events['targetInstances']
+            for instance in instanceDict:
+              if instanceDict[instance] == 'stopped':
+                  print("The target instance " + instance + " is stopped. The instance will now be started.")
+                  ec2.start_instances(
+                      InstanceIds=[instance]
+                      )
+              elif instanceDict[instance] == 'stopping':
+                  print("The target instance " + instance + " is stopping. Polling for instance to reach stopped state.")
+                  while instanceDict[instance] != 'stopped':
+                      poll = ec2.get_waiter('instance_stopped')
+                      poll.wait(
+                          InstanceIds=[instance]
+                      )
+                  ec2.start_instances(
+                      InstanceIds=[instance]
+                  )
+              else:
+                pass
+      nextStep: waitForPrimaryRunningInstances
+    - name: waitForPrimaryRunningInstances
+      action: 'aws:executeScript'
+      timeoutSeconds: 300
+      onFailure: step:returnPrimaryToOriginalState
+      inputs:
+        Runtime: python3.7
+        Handler: waitForRunningInstances
+        InputPayload:
+          targetInstances: '{{getPrimaryInstanceState.originalInstanceStates}}'
+        Script: |-
+          def waitForRunningInstances(events,context):
+            import boto3
+  
+            #Initialize client
+            ec2 = boto3.client('ec2')
+            instanceDict = events['targetInstances']
+            for instance in instanceDict:
+                poll = ec2.get_waiter('instance_running')
+                poll.wait(
+                    InstanceIds=[instance]
+                )
+                print("The target instance " + instance + " is now running.")
+      nextStep: returnPrimaryTagKey       
+    - name: returnPrimaryTagKey
+      action: 'aws:executeScript'
+      timeoutSeconds: 120
+      onFailure: Abort
+      inputs:
+        Runtime: python3.7
+        Handler: returnTagValues
+        InputPayload:
+            primaryTag: '{{PrimaryPatchGroupTag}}'
+        Script: |-
+                    def returnTagValues(events,context):
+                      stringKey = "tag:" + "PatchAutomation"
+                      return {'tagKey' : stringKey}
+      outputs:
+        - Name: Payload
+          Selector: $.Payload
+          Type: StringMap
+        - Name: primaryPatchGroupKey
+          Selector: $.Payload.tagKey
+          Type: String
+      nextStep: returnPrimaryTagValue
+    - name: returnPrimaryTagValue
+      action: 'aws:executeScript'
+      timeoutSeconds: 120
+      onFailure: Abort
+      inputs:
+        Runtime: python3.7
+        Handler: returnTagValues
+        InputPayload:
+            primaryTag: '{{PrimaryPatchGroupTag}}'
+        Script: |-
+                    def returnTagValues(events,context):
+                      tagValue = "ScriptRunning"
+                      return {'tagValue' : tagValue}
+      outputs:
+        - Name: Payload
+          Selector: $.Payload
+          Type: StringMap
+        - Name: primaryPatchGroupValue
+          Selector: $.Payload.tagValue
+          Type: String
+      nextStep: runAnsiblePlaybooks
+    - name: runAnsiblePlaybooks
+      action: 'aws:runCommand'
+      onFailure: step:returnPrimaryToOriginalState
+      timeoutSeconds: 7200
+      inputs:
+        DocumentName: AWS-ApplyAnsiblePlaybooks
+        Parameters:
+          SourceType: 'S3'
+          SourceInfo: '{"path":"https://patch-manager-report-176385768664.s3.us-west-2.amazonaws.com/install_httpd.yml"}'
+          InstallDependencies: 'True'
+          PlaybookFile: '{{AnsiblePlaybookFile}}'
+          ExtraVariables: 'SSM=True'
+          Check: 'False'
+          Verbose: '-v'
+        MaxConcurrency: 20%
+        MaxErrors: 10%
+        OutputS3BucketName: '{{ReportS3Bucket}}'
+        OutputS3KeyPrefix: '{{S3PrefixForPatchReport}}'
+        Targets:
+            - Key: '{{returnPrimaryTagKey.primaryPatchGroupKey}}'
+              Values:
+                - '{{returnPrimaryTagValue.primaryPatchGroupValue}}'
+      nextStep: returnPrimaryToOriginalState
+    - name: returnPrimaryToOriginalState
+      action: 'aws:executeScript'
+      timeoutSeconds: 600
+      onFailure: Abort
+      inputs:
+        Runtime: python3.7
+        Handler: returnToOriginalState
+        InputPayload:
+          targetInstances: '{{getPrimaryInstanceState.originalInstanceStates}}'
+        Script: |-
+          def returnToOriginalState(events,context):
+            import boto3
+  
+            #Initialize client
+            ec2 = boto3.client('ec2')
+            instanceDict = events['targetInstances']
+            for instance in instanceDict:
+              if instanceDict[instance] == 'stopped' or instanceDict[instance] == 'stopping':
+                  ec2.stop_instances(
+                      InstanceIds=[instance]
+                      )
+              else:
+                pass
+      nextStep: removeAutomationTag
+    - name: removeAutomationTag
+      action: 'aws:executeScript'
+      timeoutSeconds: 600
+      onFailure: Abort
+      inputs:
+        Runtime: python3.7
+        Handler: removeAutomationTag
+        InputPayload:
+            targetInstances: '{{getPrimaryInstanceState.originalInstanceStates}}'
+        Script: |-
+            def removeAutomationTag(events,context):
+                import boto3
+            
+                #Initialize client
+                ec2 = boto3.client('ec2')
+                instanceDict = events['targetInstances']
+                for instance in instanceDict:
+                    tag_response = ec2.delete_tags(
+                        Resources = [instance],
+                        Tags = [
+                        {
+                            'Key': 'PatchAutomation',
+                            'Value': 'ScriptRunning'
+                        }
+                     ]
+                    )
+      outputs:
+      - Name: originalInstanceStates
+        Selector: $.Payload
+        Type: StringMap
